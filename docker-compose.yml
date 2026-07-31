@@ -1,0 +1,100 @@
+services:
+  dblens-meta-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dblens
+      POSTGRES_USER: dblens
+      POSTGRES_PASSWORD: dblens
+    ports:
+      - "55433:5432"
+    volumes:
+      - dblens-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dblens -d dblens"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  simulated-prod-db:
+    image: postgres:16
+    profiles:
+      - local-target
+    restart: unless-stopped
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "55434:5432"
+    volumes:
+      - simulated-prod-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-simulated-prod.sql:/docker-entrypoint-initdb.d/001-init-simulated-prod.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  prisma-migrate:
+    build:
+      context: ./backend
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://dblens:dblens@dblens-meta-db:5432/dblens?schema=public
+    depends_on:
+      dblens-meta-db:
+        condition: service_healthy
+    restart: "no"
+
+  backend-api:
+    build:
+      context: ./backend
+    command: ["npm", "start"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://dblens:dblens@dblens-meta-db:5432/dblens?schema=public
+    depends_on:
+      dblens-meta-db:
+        condition: service_healthy
+      prisma-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  telemetry-daemon:
+    build:
+      context: ./daemon
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TARGET_DATABASE_URL: ${TARGET_DATABASE_URL:-postgresql://app:app@simulated-prod-db:5432/appdb}
+      TARGET_DATABASE_NAME: ${TARGET_DATABASE_NAME:-simulated-prod-db}
+      TARGET_DATABASE_PREFER_IPV4: ${TARGET_DATABASE_PREFER_IPV4:-false}
+      METADATA_DATABASE_URL: postgresql://dblens:dblens@dblens-meta-db:5432/dblens
+      POLL_INTERVAL_SECONDS: 60
+    depends_on:
+      prisma-migrate:
+        condition: service_completed_successfully
+
+volumes:
+  dblens-meta-data:
+  simulated-prod-data:

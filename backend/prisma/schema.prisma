@@ -1,0 +1,32 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model TargetDatabase {
+  id             String           @id @default(uuid())
+  name           String
+  connectionUri  String
+  createdAt      DateTime         @default(now())
+  metricsHistory MetricsHistory[]
+}
+
+model MetricsHistory {
+  id               String         @id @default(uuid())
+  databaseId       String
+  database         TargetDatabase @relation(fields: [databaseId], references: [id], onDelete: Cascade)
+  queryHash        String
+  normalizedQuery  String
+  callCount        BigInt
+  totalExecTimeMs  Float
+  rowsReturned     BigInt
+  sharedBlksHit    BigInt
+  sharedBlksRead   BigInt
+  snapshotTime     DateTime       @default(now())
+
+  @@index([queryHash, snapshotTime])
+}
