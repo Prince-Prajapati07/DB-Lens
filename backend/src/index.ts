@@ -1,7 +1,8 @@
 import cors from "cors";
 import express from "express";
-import type { MetricsHistory, TargetDatabase } from "@prisma/client";
+import type { MetricsHistory, Prisma, TargetDatabase } from "@prisma/client";
 
+import { buildRemediation } from "./analyzer/remediation-engine.js";
 import { prisma } from "./lib/prisma.js";
 import { analyzeMetric } from "./rules/rule-engine.js";
 
@@ -32,7 +33,13 @@ function serializeDatabase(database: TargetDatabase) {
   };
 }
 
-function serializeMetric(metric: MetricsHistory) {
+async function serializeMetric(
+  tx: Prisma.TransactionClient,
+  metric: MetricsHistory,
+) {
+  const analysis = analyzeMetric(metric);
+  const remediation = await buildRemediation(tx, metric, analysis);
+
   return {
     id: metric.id,
     databaseId: metric.databaseId,
@@ -44,7 +51,8 @@ function serializeMetric(metric: MetricsHistory) {
     sharedBlksHit: metric.sharedBlksHit.toString(),
     sharedBlksRead: metric.sharedBlksRead.toString(),
     snapshotTime: metric.snapshotTime.toISOString(),
-    analysis: analyzeMetric(metric),
+    analysis,
+    ...(remediation ? { remediation } : {}),
   };
 }
 
@@ -103,18 +111,29 @@ app.get("/api/databases/:id/metrics", async (req, res, next) => {
       return;
     }
 
-    const metrics = await prisma.metricsHistory.findMany({
-      where: {
-        databaseId: database.id,
-        snapshotTime: latestMetric.snapshotTime,
+    const serializedMetrics = await prisma.$transaction(
+      async (tx) => {
+        const metrics = await tx.metricsHistory.findMany({
+          where: {
+            databaseId: database.id,
+            snapshotTime: latestMetric.snapshotTime,
+          },
+          orderBy: { totalExecTimeMs: "desc" },
+        });
+
+        const serialized = [];
+        for (const metric of metrics) {
+          serialized.push(await serializeMetric(tx, metric));
+        }
+        return serialized;
       },
-      orderBy: { totalExecTimeMs: "desc" },
-    });
+      { timeout: 30_000 },
+    );
 
     res.json({
       database: serializeDatabase(database),
       snapshotTime: latestMetric.snapshotTime.toISOString(),
-      metrics: metrics.map(serializeMetric),
+      metrics: serializedMetrics,
     });
   } catch (error) {
     next(error);

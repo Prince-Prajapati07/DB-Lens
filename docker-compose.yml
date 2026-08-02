@@ -1,6 +1,7 @@
 services:
   dblens-meta-db:
-    image: postgres:16
+    build:
+      context: ./docker/postgres-meta
     restart: unless-stopped
     environment:
       POSTGRES_DB: dblens
