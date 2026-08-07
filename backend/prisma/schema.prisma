@@ -26,6 +26,8 @@ model MetricsHistory {
   rowsReturned     BigInt
   sharedBlksHit    BigInt
   sharedBlksRead   BigInt
+  proposedIndexSql String?
+  costReductionPct Float?
   snapshotTime     DateTime       @default(now())
 
   @@index([queryHash, snapshotTime])

@@ -1,8 +1,7 @@
 import cors from "cors";
 import express from "express";
-import type { MetricsHistory, Prisma, TargetDatabase } from "@prisma/client";
+import type { MetricsHistory, TargetDatabase } from "@prisma/client";
 
-import { buildRemediation } from "./analyzer/remediation-engine.js";
 import { prisma } from "./lib/prisma.js";
 import { analyzeMetric } from "./rules/rule-engine.js";
 
@@ -33,12 +32,22 @@ function serializeDatabase(database: TargetDatabase) {
   };
 }
 
-async function serializeMetric(
-  tx: Prisma.TransactionClient,
-  metric: MetricsHistory,
-) {
+function buildRemediation(metric: MetricsHistory) {
+  if (!metric.proposedIndexSql || metric.costReductionPct === null) {
+    return null;
+  }
+
+  return {
+    proposed_sql: metric.proposedIndexSql,
+    estimated_cost_reduction_percentage: metric.costReductionPct,
+    sandbox_note:
+      "HypoPG estimate was calculated on the target database using target schema and statistics.",
+  };
+}
+
+function serializeMetric(metric: MetricsHistory) {
   const analysis = analyzeMetric(metric);
-  const remediation = await buildRemediation(tx, metric, analysis);
+  const remediation = buildRemediation(metric);
 
   return {
     id: metric.id,
@@ -111,29 +120,18 @@ app.get("/api/databases/:id/metrics", async (req, res, next) => {
       return;
     }
 
-    const serializedMetrics = await prisma.$transaction(
-      async (tx) => {
-        const metrics = await tx.metricsHistory.findMany({
-          where: {
-            databaseId: database.id,
-            snapshotTime: latestMetric.snapshotTime,
-          },
-          orderBy: { totalExecTimeMs: "desc" },
-        });
-
-        const serialized = [];
-        for (const metric of metrics) {
-          serialized.push(await serializeMetric(tx, metric));
-        }
-        return serialized;
+    const metrics = await prisma.metricsHistory.findMany({
+      where: {
+        databaseId: database.id,
+        snapshotTime: latestMetric.snapshotTime,
       },
-      { timeout: 30_000 },
-    );
+      orderBy: { totalExecTimeMs: "desc" },
+    });
 
     res.json({
       database: serializeDatabase(database),
       snapshotTime: latestMetric.snapshotTime.toISOString(),
-      metrics: serializedMetrics,
+      metrics: metrics.map(serializeMetric),
     });
   } catch (error) {
     next(error);

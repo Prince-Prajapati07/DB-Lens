@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: dblens
       POSTGRES_PASSWORD: dblens
     ports:
-      - "55433:5432"
+      - "${META_DB_PORT:-55433}:5432"
     volumes:
       - dblens-meta-data:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +18,8 @@ services:
       retries: 12
 
   simulated-prod-db:
-    image: postgres:16
+    build:
+      context: ./docker/postgres-meta
     profiles:
       - local-target
     restart: unless-stopped
@@ -33,7 +34,7 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
     ports:
-      - "55434:5432"
+      - "${TARGET_DB_PORT:-55434}:5432"
     volumes:
       - simulated-prod-data:/var/lib/postgresql/data
       - ./docker/postgres/init-simulated-prod.sql:/docker-entrypoint-initdb.d/001-init-simulated-prod.sql:ro
@@ -69,7 +70,7 @@ services:
       prisma-migrate:
         condition: service_completed_successfully
     ports:
-      - "3000:3000"
+      - "${BACKEND_PORT:-3000}:3000"
     healthcheck:
       test:
         [
