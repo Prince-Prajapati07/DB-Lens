@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -28,6 +29,34 @@ LIMIT 50;
 """
 
 
+RESERVED_WORDS = {
+    "and",
+    "or",
+    "not",
+    "null",
+    "true",
+    "false",
+    "select",
+    "from",
+    "where",
+    "join",
+    "on",
+    "in",
+    "is",
+    "like",
+}
+
+SKIPPED_RELATIONS = {
+    "information_schema",
+    "pg_available_extensions",
+    "pg_catalog",
+    "pg_extension",
+    "pg_namespace",
+    "pg_stat_statements",
+    "pg_stat_statements_info",
+}
+
+
 @dataclass(frozen=True)
 class DaemonConfig:
     target_database_url: str
@@ -35,6 +64,13 @@ class DaemonConfig:
     metadata_database_url: str
     poll_interval_seconds: int
     prefer_ipv4: bool
+
+
+@dataclass(frozen=True)
+class CandidateIndex:
+    table_parts: list[str]
+    columns: list[str]
+    proposed_sql: str
 
 
 def configure_logging() -> None:
@@ -104,15 +140,272 @@ def target_connection_url(config: DaemonConfig) -> str:
     return with_ipv4_hostaddr(config.target_database_url)
 
 
+def normalize_sql(sql: str) -> str:
+    without_line_comments = re.sub(r"--.*?(?=\n|$)", " ", sql)
+    without_block_comments = re.sub(r"/\*.*?\*/", " ", without_line_comments, flags=re.S)
+    return re.sub(r"\s+", " ", without_block_comments).strip().rstrip(";")
+
+
+def quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def sanitize_identifier(raw: str) -> str | None:
+    cleaned = raw.replace('"', "").strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cleaned):
+        return None
+    if cleaned.lower() in RESERVED_WORDS:
+        return None
+    return cleaned
+
+
+def split_table_name(raw: str) -> list[str] | None:
+    parts = []
+    for part in raw.split("."):
+        cleaned = sanitize_identifier(part)
+        if not cleaned:
+            return None
+        parts.append(cleaned)
+
+    return parts if 0 < len(parts) <= 2 else None
+
+
+def format_table_name(parts: list[str]) -> str:
+    return ".".join(quote_identifier(part) for part in parts)
+
+
+def extract_target_table(query: str) -> list[str] | None:
+    normalized = normalize_sql(query)
+    match = re.search(r'\bfrom\s+("?\w+"?(?:\."?\w+"?)?)', normalized, re.I)
+    if not match:
+        return None
+
+    after_table = normalized[match.end() :].lstrip()
+    if after_table.startswith("("):
+        return None
+
+    return split_table_name(match.group(1))
+
+
+def extract_predicate_columns(query: str) -> list[str]:
+    normalized = normalize_sql(query)
+    columns: list[str] = []
+    seen = set()
+    predicate_pattern = re.compile(
+        r'(?:^|[\s(])(?:(?:"?[A-Za-z_][A-Za-z0-9_]*"?)[.])?"?'
+        r'([A-Za-z_][A-Za-z0-9_]*)"?\s*(?:=|>=|<=|>|<|\bin\b|\blike\b|\bis\b)',
+        re.I,
+    )
+    section_pattern = re.compile(
+        r"\b(?:where|on)\b(.+?)(?:\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)",
+        re.I,
+    )
+
+    for section_match in section_pattern.finditer(normalized):
+        for column_match in predicate_pattern.finditer(section_match.group(1)):
+            column = sanitize_identifier(column_match.group(1))
+            if column and column not in seen:
+                seen.add(column)
+                columns.append(column)
+            if len(columns) >= 3:
+                return columns
+
+    return columns
+
+
+def build_candidate_index(query: str) -> CandidateIndex | None:
+    table_parts = extract_target_table(query)
+    columns = extract_predicate_columns(query)
+    if not table_parts or not columns:
+        return None
+    if any(part.lower() in SKIPPED_RELATIONS for part in table_parts):
+        return None
+
+    index_name = quote_identifier(
+        f"idx_dblens_{table_parts[-1]}_{'_'.join(columns)}"[:62]
+    )
+    column_sql = ", ".join(quote_identifier(column) for column in columns)
+    return CandidateIndex(
+        table_parts=table_parts,
+        columns=columns,
+        proposed_sql=f"CREATE INDEX {index_name} ON {format_table_name(table_parts)} ({column_sql});",
+    )
+
+
+def validate_candidate_index(cur: psycopg.Cursor, candidate: CandidateIndex) -> bool:
+    relation_name = ".".join(candidate.table_parts)
+    try:
+        cur.execute(
+            """
+            SELECT c.oid
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(%s)
+              AND c.relkind IN ('r', 'p')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+            """,
+            (relation_name,),
+        )
+        relation = cur.fetchone()
+        if not relation:
+            cur.connection.rollback()
+            return False
+
+        relation_oid = relation["oid"]
+        cur.execute(
+            """
+            SELECT attname
+            FROM pg_attribute
+            WHERE attrelid = %s
+              AND attnum > 0
+              AND NOT attisdropped
+            """,
+            (relation_oid,),
+        )
+        existing_columns = {row["attname"] for row in cur.fetchall()}
+        cur.connection.commit()
+        return all(column in existing_columns for column in candidate.columns)
+    except psycopg.Error as exc:
+        logging.info("Candidate validation skipped: %s", exc)
+        cur.connection.rollback()
+        return False
+
+
+def explainable_query(query: str) -> str | None:
+    normalized = normalize_sql(query)
+    if not re.match(r"^(select|with)\b", normalized, re.I):
+        return None
+    return re.sub(r"\$\d+", "NULL", normalized)
+
+
+def extract_total_cost(explain_rows: list[dict[str, Any]]) -> float | None:
+    if not explain_rows:
+        return None
+
+    plan_payload = explain_rows[0].get("QUERY PLAN")
+    if isinstance(plan_payload, list) and plan_payload:
+        cost = plan_payload[0].get("Plan", {}).get("Total Cost")
+        if isinstance(cost, (int, float)):
+            return float(cost)
+
+    return None
+
+
+def plan_has_seq_scan(plan: dict[str, Any]) -> bool:
+    if plan.get("Node Type") == "Seq Scan":
+        return True
+    return any(plan_has_seq_scan(child) for child in plan.get("Plans", []))
+
+
+def explain_plan_has_seq_scan(explain_rows: list[dict[str, Any]]) -> bool:
+    if not explain_rows:
+        return False
+
+    plan_payload = explain_rows[0].get("QUERY PLAN")
+    if not isinstance(plan_payload, list) or not plan_payload:
+        return False
+
+    plan = plan_payload[0].get("Plan")
+    return isinstance(plan, dict) and plan_has_seq_scan(plan)
+
+
+def explain_query(cur: psycopg.Cursor, query: str) -> list[dict[str, Any]] | None:
+    try:
+        cur.execute(f"EXPLAIN (FORMAT JSON) {query}")
+        return [dict(row) for row in cur.fetchall()]
+    except psycopg.Error as exc:
+        logging.info("Skipping EXPLAIN for unsupported statement: %s", exc)
+        cur.connection.rollback()
+        return None
+
+
+def ensure_hypopg(cur: psycopg.Cursor) -> bool:
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS hypopg")
+        cur.connection.commit()
+        return True
+    except psycopg.Error as exc:
+        logging.warning("HypoPG is unavailable on target database: %s", exc)
+        cur.connection.rollback()
+        return False
+
+
+def reset_hypopg(cur: psycopg.Cursor) -> None:
+    try:
+        cur.execute("SELECT hypopg_reset()")
+        cur.connection.commit()
+    except psycopg.Error as exc:
+        logging.info("HypoPG reset skipped: %s", exc)
+        cur.connection.rollback()
+
+
+def simulate_candidate_index(
+    cur: psycopg.Cursor,
+    query: str,
+    proposed_index_sql: str,
+) -> float | None:
+    explain_before = explain_query(cur, query)
+    if not explain_before or not explain_plan_has_seq_scan(explain_before):
+        return None
+
+    before_cost = extract_total_cost(explain_before)
+    if not before_cost or before_cost <= 0:
+        return None
+
+    try:
+        cur.execute("SELECT * FROM hypopg_reset()")
+        cur.execute("SELECT * FROM hypopg_create_index(%s)", (proposed_index_sql,))
+        explain_after = explain_query(cur, query)
+        cur.execute("SELECT * FROM hypopg_reset()")
+        cur.connection.commit()
+    except psycopg.Error as exc:
+        logging.info("HypoPG simulation skipped: %s", exc)
+        cur.connection.rollback()
+        reset_hypopg(cur)
+        return None
+
+    after_cost = extract_total_cost(explain_after or [])
+    if after_cost is None:
+        return None
+
+    reduction = max(0.0, ((before_cost - after_cost) / before_cost) * 100)
+    return round(reduction, 2)
+
+
+def add_target_side_remediation(
+    cur: psycopg.Cursor,
+    metrics: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not ensure_hypopg(cur):
+        return metrics
+
+    enriched = []
+    simulations = 0
+    for row in metrics:
+        enriched_row = dict(row)
+        query = explainable_query(str(row["query"]))
+        candidate = build_candidate_index(str(row["query"]))
+        if query and candidate and validate_candidate_index(cur, candidate):
+            reduction = simulate_candidate_index(cur, query, candidate.proposed_sql)
+            if reduction and reduction > 0:
+                enriched_row["proposed_index_sql"] = candidate.proposed_sql
+                enriched_row["cost_reduction_pct"] = reduction
+                simulations += 1
+
+        enriched.append(enriched_row)
+
+    logging.info("Calculated %s target-side HypoPG remediation estimates", simulations)
+    return enriched
+
+
 def fetch_target_metrics(config: DaemonConfig) -> list[dict[str, Any]] | None:
     try:
         with psycopg.connect(target_connection_url(config), row_factory=dict_row) as conn:
             with conn.cursor() as cur:
-                cur.execute("SET TRANSACTION READ ONLY")
                 cur.execute(PG_STAT_STATEMENTS_SCAN)
                 rows = cur.fetchall()
                 logging.info("Fetched %s pg_stat_statements rows from target", len(rows))
-                return [dict(row) for row in rows]
+                return add_target_side_remediation(cur, [dict(row) for row in rows])
     except psycopg.Error as exc:
         logging.warning("Target database read failed: %s", exc)
         return None
@@ -165,6 +458,8 @@ def insert_metrics_batch(
             int(row["rows"]),
             int(row["shared_blks_hit"]),
             int(row["shared_blks_read"]),
+            row.get("proposed_index_sql"),
+            row.get("cost_reduction_pct"),
         )
         for row in metrics
         if row.get("query_hash") is not None
@@ -185,9 +480,11 @@ def insert_metrics_batch(
                 "totalExecTimeMs",
                 "rowsReturned",
                 "sharedBlksHit",
-                "sharedBlksRead"
+                "sharedBlksRead",
+                "proposedIndexSql",
+                "costReductionPct"
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             rows,
         )
